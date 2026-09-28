@@ -327,8 +327,6 @@ PROXY_TEST_TIMEOUT = float(os.getenv("PROXY_TEST_TIMEOUT", "4"))
 PROXY_TEST_CONCURRENCY = int(os.getenv("PROXY_TEST_CONCURRENCY", "10"))
 NETWORK_WATCHDOG_SECONDS = float(os.getenv("NETWORK_WATCHDOG_SECONDS", "4"))
 NETWORK_FAILURES_BEFORE_RECONNECT = int(os.getenv("NETWORK_FAILURES_BEFORE_RECONNECT", "1"))
-RAILWAY_MODE = os.getenv("RAILWAY_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
-
 _active_proxy_url = None
 _active_connection_mode = None  # "vpn" or "proxy"
 
@@ -446,24 +444,8 @@ async def _test_system_connection():
 
 
 async def _build_bot_with_working_proxy():
-    """Choose Telegram connectivity for Railway or Android/Pydroid safely."""
+    """Choose Telegram connectivity, preferring an active VPN and then proxy fallback."""
     global _active_proxy_url, _active_connection_mode
-
-    # Railway has no Android VPN interface. Prefer the platform's normal
-    # outbound connection first, then keep the existing proxy fallback.
-    if RAILWAY_MODE:
-        latency = await _test_system_connection()
-        if latency is not None:
-            _active_proxy_url = None
-            _active_connection_mode = "system"
-            session = AiohttpSession()
-            bot_instance = Bot(BOT_TOKEN, session=session)
-            logger.info(
-                "Railway direct Telegram connection is available (latency %.0f ms); using it without proxy.",
-                latency,
-            )
-            return bot_instance, session
-        logger.warning("Railway direct Telegram connection failed; falling back to proxy selection.")
 
     # Existing Android/Pydroid behavior: prefer an active VPN when available.
     vpn_detected = _vpn_interface_present()
@@ -538,7 +520,7 @@ async def _network_watchdog():
         # If the bot is currently using a proxy and Android/Pydroid reports
         # that a VPN has become active, test the VPN immediately. If it works,
         # stop polling so main() rebuilds the Bot without a proxy.
-        if (not RAILWAY_MODE) and _active_connection_mode == "proxy" and _vpn_interface_present():
+        if _active_connection_mode == "proxy" and _vpn_interface_present():
             vpn_latency = await _test_system_connection()
             if vpn_latency is not None:
                 logger.info(
@@ -9168,10 +9150,39 @@ async def _anti_spam_fallback(message:Message):
     if len(bucket)>_SPAM_LIMIT: logger.warning("Rate-limit warning for user %s",uid)
 
 #=========================================================
+# RENDER HEALTH SERVER
+#=========================================================
+
+async def _render_health_handler(request):
+    return aiohttp.web.Response(text="OK")
+
+
+async def _start_render_health_server():
+    """Bind a tiny HTTP health server so Render Web Service can detect a port."""
+    port_raw = os.getenv("PORT", "10000").strip()
+    try:
+        port = int(port_raw)
+    except ValueError:
+        port = 10000
+
+    app = aiohttp.web.Application()
+    app.router.add_get("/", _render_health_handler)
+    app.router.add_get("/health", _render_health_handler)
+
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("Render health server listening on 0.0.0.0:%s", port)
+    return runner
+
+
+#=========================================================
 # MAIN
 #=========================================================
 
 async def main():
+    render_health_runner = await _start_render_health_server()
     init_db()
     _load_admins_from_database(seed=True)
     if not ADMIN_IDS:
